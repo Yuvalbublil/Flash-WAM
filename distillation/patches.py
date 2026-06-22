@@ -36,7 +36,7 @@ class SafeMultiLatentLeRobotDataset:
     (e.g. incomplete downloads, missing parquet files).
     """
 
-    def __init__(self, config, num_init_worker=128):
+    def __init__(self, config, split="train", num_init_worker=128):
         import os
         from pathlib import Path
         from dataset.lerobot_latent_dataset import (
@@ -44,13 +44,14 @@ class SafeMultiLatentLeRobotDataset:
             LatentLeRobotDataset,
         )
 
+        self.split = split
         repo_list = recursive_find_file(config.dataset_path, "info.json")
         repo_list = [v.split("/meta/info.json")[0] for v in repo_list]
 
         self._datasets = []
         for repo_id in repo_list:
             try:
-                ds = LatentLeRobotDataset(repo_id=repo_id, config=config)
+                ds = LatentLeRobotDataset(repo_id=repo_id, config=config, split=split)
                 self._datasets.append(ds)
             except Exception as e:
                 print(f"WARNING: Skipping incomplete dataset {os.path.basename(repo_id)}: {e}")

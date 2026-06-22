@@ -6,6 +6,7 @@ import numpy as np
 from pathlib import Path
 from collections.abc import Callable
 import os
+import hashlib
 from tqdm import tqdm
 from multiprocessing import Pool
 from functools import partial
@@ -14,6 +15,30 @@ from einops import rearrange
 from torch.utils.data import DataLoader
 from scipy.spatial.transform import Rotation as R
 from lerobot.constants import HF_LEROBOT_HOME
+
+def resolve_split_setting(config, attr, env, default, cast):
+    """Resolve a split/eval knob as config attr -> env var -> default.
+
+    Lets the same dataset code serve any config (LIBERO, RoboTwin) without
+    editing each one: a config may set the attribute, otherwise an env var is
+    used, otherwise the default. Dataset-agnostic and rank-independent.
+    """
+    val = getattr(config, attr, None)
+    if val is None:
+        val = os.environ.get(env)
+    if val is None:
+        val = default
+    return cast(val)
+
+
+def _stable_hash(key):
+    """Deterministic hash (unlike builtin hash(), which is salted per process).
+
+    Used to give each task stratum an independent, reproducible shuffle so the
+    train/val split is identical across runs, resumes and DDP ranks.
+    """
+    return int(hashlib.sha1(repr(key).encode("utf-8")).hexdigest(), 16)
+
 
 def recursive_find_file(directory, filename='info.json'):
     result = []
@@ -31,19 +56,23 @@ def recursive_find_file(directory, filename='info.json'):
 def construct_lerobot(
     repo_id,
     config,
+    split="train",
 ):
     return LatentLeRobotDataset(
         repo_id=repo_id,
         config=config,
+        split=split,
     )
 
-def construct_lerobot_multi_processor(config, 
+def construct_lerobot_multi_processor(config,
                                       num_init_worker=8,
+                                      split="train",
                                       ):
     datasets_out_lst = []
     construct_func = partial(
         construct_lerobot,
         config=config,
+        split=split,
     )
     repo_list = recursive_find_file(config.dataset_path, 'info.json')
     repo_list = [v.split('/meta/info.json')[0] for v in repo_list]
@@ -72,9 +101,11 @@ class MultiLatentLeRobotDataset(torch.utils.data.Dataset):
         self,
         config,
         num_init_worker=128,
+        split="train",
     ):
-        self._datasets = construct_lerobot_multi_processor(config, 
-                                                           num_init_worker, 
+        self._datasets = construct_lerobot_multi_processor(config,
+                                                           num_init_worker,
+                                                           split=split,
                                                            )
         self.item_id_to_dataset_id, self.acc_dset_num = (
             self._get_item_id_to_dataset_id()
@@ -110,7 +141,9 @@ class LatentLeRobotDataset(LeRobotDataset):
         self,
         repo_id,
         config=None,
+        split="train",
     ):
+        self.split = split
         self.repo_id = repo_id
         self.root = HF_LEROBOT_HOME / repo_id
         self.image_transforms = None
@@ -154,6 +187,57 @@ class LatentLeRobotDataset(LeRobotDataset):
                 output_all_columns=False
             )
         self.parse_meta()
+        self._apply_split()
+
+    def _apply_split(self):
+        """Filter new_metas to the requested train/val split.
+
+        The split unit is the *episode* (all of an episode's metas/chunks go to
+        the same side), which keeps it leakage-free even when an episode emits
+        multiple action_config chunks (e.g. RoboTwin). Episodes are stratified
+        by task when task metadata is usable, else split flat. Deterministic
+        given split_seed, so train/val are disjoint and stable across ranks.
+        """
+        val_fraction = resolve_split_setting(
+            self.config, "val_fraction", "VAL_FRACTION", 0.0, float)
+        if val_fraction <= 0.0 or self.split == "all":
+            return
+        split_seed = resolve_split_setting(
+            self.config, "split_seed", "SPLIT_SEED", 42, int)
+
+        # Map each unique episode to its task stratum (first-seen order).
+        ep_to_task = {}
+        for meta in self.new_metas:
+            ep = meta["episode_index"]
+            if ep not in ep_to_task:
+                tasks = meta.get("tasks")
+                if isinstance(tasks, (list, tuple)):
+                    ep_to_task[ep] = tuple(tasks)
+                else:
+                    ep_to_task[ep] = (tasks,)
+
+        # Group episodes by stratum; degenerate grouping -> one flat group.
+        groups = {}
+        for ep, key in ep_to_task.items():
+            groups.setdefault(key, []).append(ep)
+        if len(groups) <= 1:
+            groups = {("__all__",): list(ep_to_task.keys())}
+
+        val_eps = set()
+        for key, eps in groups.items():
+            eps_sorted = sorted(eps)
+            rng = np.random.default_rng(split_seed + (_stable_hash(key) % (2 ** 31)))
+            perm = rng.permutation(len(eps_sorted))
+            n_val = min(len(eps_sorted), max(1, round(val_fraction * len(eps_sorted))))
+            for i in perm[:n_val]:
+                val_eps.add(eps_sorted[i])
+
+        if self.split == "val":
+            keep = val_eps
+        else:  # "train"
+            keep = set(ep_to_task.keys()) - val_eps
+
+        self.new_metas = [m for m in self.new_metas if m["episode_index"] in keep]
 
     def parse_meta(self):
         out = []
