@@ -179,7 +179,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         # ==============================================================
         logger.info("Loading dataset ...")
         from patches import SafeMultiLatentLeRobotDataset as MultiLatentLeRobotDataset
-        train_dataset = MultiLatentLeRobotDataset(config=config)
+        train_dataset = MultiLatentLeRobotDataset(config=config, split="train")
         train_sampler = (
             DistributedSampler(train_dataset, num_replicas=config.world_size,
                                rank=config.rank, shuffle=True, seed=config.seed)
@@ -192,6 +192,29 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             num_workers=config.load_worker,
             sampler=train_sampler,
         )
+
+        # Validation loader (opt-in: only when a val fraction is held out).
+        self.val_loader = None
+        self.eval_interval = int(getattr(config, "eval_interval", 0) or 0)
+        self.eval_max_batches = int(getattr(config, "eval_max_batches", 0) or 0)
+        self.best_val_loss = float("inf")
+        if float(getattr(config, "val_fraction", 0.0) or 0.0) > 0.0 and self.eval_interval > 0:
+            val_dataset = MultiLatentLeRobotDataset(config=config, split="val")
+            val_sampler = (
+                DistributedSampler(val_dataset, num_replicas=config.world_size,
+                                   rank=config.rank, shuffle=False, drop_last=False)
+                if config.world_size > 1 else None
+            )
+            self.val_loader = DataLoader(
+                val_dataset,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.load_worker,
+                sampler=val_sampler,
+            )
+            logger.info(f"Validation enabled: {len(val_dataset)} val samples, "
+                        f"eval every {self.eval_interval} steps")
+
         self.save_dir = Path(config.output_dir) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.train_loader_iter = None
@@ -199,7 +222,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
     # ==================================================================
     # Save checkpoint
     # ==================================================================
-    def _save_checkpoint(self, which="online_student"):
+    def _save_checkpoint(self, which="online_student", subdir=None):
         model = self.student if which == "online_student" else self.target_student
         try:
             state_dict = get_model_state_dict(
@@ -207,7 +230,7 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             state_dict_bf16 = {k: v.to(torch.bfloat16) for k, v in state_dict.items()}
 
             if self.config.rank == 0:
-                ckpt_dir = self.save_dir / f"step_{self.step}" / which / "transformer"
+                ckpt_dir = self.save_dir / (subdir or f"step_{self.step}") / which / "transformer"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 save_file(state_dict_bf16, ckpt_dir / "diffusion_pytorch_model.safetensors")
                 config_dict = dict(model.config)
@@ -225,6 +248,68 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 logger.error(traceback.format_exc())
             if dist.is_initialized():
                 dist.barrier()
+
+    # ==================================================================
+    # Mid-training validation: no-grad distillation loss on the held-out
+    # split. Uses a fixed RNG seed so the stochastic timesteps/noise/cfg are
+    # identical across eval calls (the val curve reflects the model, not RNG).
+    # ==================================================================
+    @torch.no_grad()
+    def _evaluate(self):
+        config = self.config
+        was_training = self.student.training
+        self.student.eval()
+        self.target_student.eval()
+
+        # Freeze eval randomness, restore afterwards so training is unaffected.
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state(self.device) if torch.cuda.is_available() else None
+        torch.manual_seed(getattr(config, "split_seed", config.seed))
+
+        sums = {"total": 0.0, "video": 0.0, "action": 0.0, "action_aware": 0.0}
+        n = 0
+        try:
+            for i, batch in enumerate(self.val_loader):
+                if self.eval_max_batches and i >= self.eval_max_batches:
+                    break
+                result = self._compute_step(batch, batch_idx=0, train=False)
+                video = result["video_loss"].float()
+                action = result["action_loss"].float()
+                aware = result["action_aware_loss"].float()
+                total = (video
+                         + config.action_loss_weight * action
+                         + getattr(config, "action_aware_weight", 0.0) * aware)
+                sums["total"] += total
+                sums["video"] += video
+                sums["action"] += action
+                sums["action_aware"] += aware
+                n += 1
+        finally:
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, self.device)
+            if was_training:
+                self.student.train()
+            self.target_student.train()
+
+        denom = max(n, 1)
+        means = {k: dist_mean((v / denom)).item() for k, v in sums.items()}
+
+        if config.rank == 0:
+            logger.info(f"[step {self.step}] val loss={means['total']:.4f} "
+                        f"(v={means['video']:.4f} a={means['action']:.4f})")
+            if config.enable_wandb and HAS_WANDB:
+                wandb.log({
+                    "val/loss_total": means["total"],
+                    "val/video_consistency": means["video"],
+                    "val/action_consistency": means["action"],
+                    "val/action_aware": means["action_aware"],
+                }, step=self.step)
+
+        # Checkpoint selection: save best-by-val-loss.
+        if means["total"] < self.best_val_loss:
+            self.best_val_loss = means["total"]
+            self._save_checkpoint("online_student", subdir="best")
 
     # ==================================================================
     # Main training loop
@@ -338,6 +423,10 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 if self.step % config.save_interval == 0:
                     self._save_checkpoint("online_student")
                     self._save_checkpoint("target_student")
+
+                if (self.val_loader is not None and self.eval_interval > 0
+                        and self.step % self.eval_interval == 0):
+                    self._evaluate()
 
             if dist.is_initialized():
                 dist.barrier()

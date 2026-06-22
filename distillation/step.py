@@ -41,9 +41,17 @@ class StepMixin:
         return c_skip * noisy_latent + c_out * pred_x0
 
     # ==================================================================
-    # One training step
+    # One training step (thin wrapper over the shared forward/loss body)
     # ==================================================================
     def _train_step(self, batch, batch_idx):
+        return self._compute_step(batch, batch_idx, train=True)
+
+    # ==================================================================
+    # Shared forward + loss. train=True keeps the exact training behavior
+    # (grad-sync toggling + backward); train=False runs the student forward
+    # under no_grad and skips backward — used for mid-training validation.
+    # ==================================================================
+    def _compute_step(self, batch, batch_idx, train=True):
         batch = self.convert_input_format(batch)
 
         B = batch['latents'].shape[0]
@@ -117,12 +125,12 @@ class StepMixin:
 
         # ---- 4. Online student consistency prediction at sigma_start ----
         should_sync = (batch_idx + 1) % self.gradient_accumulation_steps == 0
-        if not should_sync:
-            self.student.set_requires_gradient_sync(False)
+        if train:
+            self.student.set_requires_gradient_sync(should_sync)
+            student_video_v_seq, student_action_v_seq = self.student(input_dict, train_mode=True)
         else:
-            self.student.set_requires_gradient_sync(True)
-
-        student_video_v_seq, student_action_v_seq = self.student(input_dict, train_mode=True)
+            with torch.no_grad():
+                student_video_v_seq, student_action_v_seq = self.student(input_dict, train_mode=True)
 
         # ---- 4a. Video consistency prediction ----
         if self.distill_video:
@@ -230,7 +238,8 @@ class StepMixin:
                 logger.warning(f"[step {self.step}] NaN/Inf loss, skipping")
             loss = torch.zeros(1, device=self.device, requires_grad=True)
 
-        loss.backward()
+        if train:
+            loss.backward()
 
         return {
             "loss": loss.detach(),
