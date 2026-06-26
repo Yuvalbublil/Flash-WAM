@@ -193,9 +193,22 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             sampler=train_sampler,
         )
 
+        # Epoch tracking (one epoch == one full pass over the train set).
+        # batches_per_epoch is the per-rank batch count; under DDP the
+        # DistributedSampler pads it equal across ranks, so epoch counting stays
+        # in sync without communication.
+        self.epoch = 0
+        self.batch_in_epoch = 0
+        self._epoch_started = False     # set by _get_next_batch on first iter / each wrap
+        self.batches_per_epoch = max(1, len(self.train_loader))
+
         # Validation loader (opt-in: only when a val fraction is held out).
+        # eval_interval is measured in EPOCHS (float): 1.0 = end of every epoch,
+        # 0.5 = mid- and end-of-epoch, etc. _next_eval_epoch is the next
+        # cumulative-epoch threshold at which to run validation.
         self.val_loader = None
-        self.eval_interval = int(getattr(config, "eval_interval", 0) or 0)
+        self.eval_interval = float(getattr(config, "eval_interval", 0.0) or 0.0)
+        self._next_eval_epoch = self.eval_interval
         self.eval_max_batches = int(getattr(config, "eval_max_batches", 0) or 0)
         self.best_val_loss = float("inf")
         if float(getattr(config, "val_fraction", 0.0) or 0.0) > 0.0 and self.eval_interval > 0:
@@ -212,8 +225,10 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                 num_workers=config.load_worker,
                 sampler=val_sampler,
             )
+            steps_per_epoch = self.batches_per_epoch / self.gradient_accumulation_steps
             logger.info(f"Validation enabled: {len(val_dataset)} val samples, "
-                        f"eval every {self.eval_interval} steps")
+                        f"eval every {self.eval_interval} epoch(s) "
+                        f"(~{steps_per_epoch:.0f} optimizer steps/epoch)")
 
         self.save_dir = Path(config.output_dir) / "checkpoints"
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -351,6 +366,15 @@ class FlashWAMDistiller(DataMixin, StepMixin):
 
         while self.step < config.max_train_steps:
             batch = self._get_next_batch()
+
+            # Log the epoch number at the start of each epoch (incl. epoch 0).
+            if self._epoch_started:
+                self._epoch_started = False
+                if config.rank == 0:
+                    logger.info(f"[step {self.step}] starting epoch {self.epoch}")
+                    if config.enable_wandb and HAS_WANDB:
+                        wandb.log({"train/epoch": self.epoch}, step=self.step)
+
             result = self._train_step(batch, step_in_acc)
             acc_losses.append(result["loss"])
             acc_video_losses.append(result["video_loss"])
@@ -424,9 +448,14 @@ class FlashWAMDistiller(DataMixin, StepMixin):
                     self._save_checkpoint("online_student")
                     self._save_checkpoint("target_student")
 
-                if (self.val_loader is not None and self.eval_interval > 0
-                        and self.step % self.eval_interval == 0):
-                    self._evaluate()
+                # Validation cadence is in epoch units: fire at the first sync
+                # point at/after each multiple of eval_interval epochs.
+                if self.val_loader is not None and self.eval_interval > 0:
+                    cur_epoch_pos = self.epoch + self.batch_in_epoch / self.batches_per_epoch
+                    if cur_epoch_pos + 1e-9 >= self._next_eval_epoch:
+                        self._evaluate()
+                        while self._next_eval_epoch <= cur_epoch_pos + 1e-9:
+                            self._next_eval_epoch += self.eval_interval
 
             if dist.is_initialized():
                 dist.barrier()

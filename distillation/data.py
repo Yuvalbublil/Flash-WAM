@@ -11,13 +11,18 @@ class DataMixin:
     def _get_next_batch(self):
         if self.train_loader_iter is None:
             self.train_loader_iter = iter(self.train_loader)
+            self._epoch_started = True          # epoch 0 begins
         try:
             batch = next(self.train_loader_iter)
         except StopIteration:
             if hasattr(self.train_loader.sampler, 'set_epoch'):
                 self.train_loader.sampler.set_epoch(self.train_loader.sampler.epoch + 1)
+            self.epoch += 1
+            self.batch_in_epoch = 0
+            self._epoch_started = True          # new epoch begins
             self.train_loader_iter = iter(self.train_loader)
             batch = next(self.train_loader_iter)
+        self.batch_in_epoch += 1
         return batch
 
     # ==================================================================
