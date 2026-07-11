@@ -217,10 +217,16 @@ class LatentLeRobotDataset(LeRobotDataset):
                     ep_to_task[ep] = (tasks,)
 
         # Group episodes by stratum; degenerate grouping -> one flat group.
+        # Strata must be large enough to hold out val_fraction meaningfully:
+        # with per-episode-unique task strings (e.g. instruction-augmented
+        # RoboTwin), every episode is its own stratum and max(1, ...) below
+        # would send ~all of them to val, inverting the split. If the mean
+        # stratum is smaller than 1/val_fraction episodes, split flat instead.
         groups = {}
         for ep, key in ep_to_task.items():
             groups.setdefault(key, []).append(ep)
-        if len(groups) <= 1:
+        mean_group_size = len(ep_to_task) / max(1, len(groups))
+        if len(groups) <= 1 or mean_group_size < 1.0 / val_fraction:
             groups = {("__all__",): list(ep_to_task.keys())}
 
         val_eps = set()
