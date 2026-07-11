@@ -1,6 +1,7 @@
 """FlashWAMDistiller: model/optimizer/dataset setup, training loop, checkpointing."""
 import gc
 import json
+import math
 import os
 from pathlib import Path
 
@@ -28,6 +29,15 @@ except ImportError:
 from data import DataMixin
 from step import StepMixin
 from ema import update_ema
+
+
+def warmup_cosine_lambda(step, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """Linear warmup, then cosine decay from 1.0 to min_lr_ratio at total_steps."""
+    if step < warmup_steps:
+        return step / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
 
 class FlashWAMDistiller(DataMixin, StepMixin):
@@ -162,9 +172,24 @@ class FlashWAMDistiller(DataMixin, StepMixin):
             fused=True,
             foreach=False,
         )
+        lr_scheduler_type = str(getattr(config, "lr_scheduler_type", "constant"))
+        if lr_scheduler_type == "cosine":
+            lr_lambda = lambda step: warmup_cosine_lambda(
+                step, warmup_steps=config.warmup_steps,
+                total_steps=config.max_train_steps,
+                min_lr_ratio=float(getattr(config, "min_lr_ratio", 0.1)))
+        elif lr_scheduler_type == "constant":
+            lr_lambda = lambda step: warmup_constant_lambda(
+                step, warmup_steps=config.warmup_steps)
+        else:
+            raise ValueError(f"Unknown lr_scheduler_type: {lr_scheduler_type!r} "
+                             f"(expected 'constant' or 'cosine')")
+        if config.rank == 0:
+            logger.info(f"LR scheduler: {lr_scheduler_type} "
+                        f"(warmup_steps={config.warmup_steps})")
         self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer,
-            lr_lambda=lambda step: warmup_constant_lambda(step, warmup_steps=config.warmup_steps),
+            lr_lambda=lr_lambda,
         )
         # Fast-forward LR scheduler to the resume step
         if self.step > 0:
@@ -210,6 +235,13 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         self.eval_interval = float(getattr(config, "eval_interval", 0.0) or 0.0)
         self._next_eval_epoch = self.eval_interval
         self.eval_max_batches = int(getattr(config, "eval_max_batches", 0) or 0)
+        # best_metric: "total" (video-dominated val/loss_total) or "action"
+        # (action_consistency + action_aware_weight * action_aware) — the action
+        # head is what drives downstream task success.
+        self.best_metric = str(getattr(config, "best_metric", "total"))
+        if self.best_metric not in ("total", "action"):
+            raise ValueError(f"Unknown best_metric: {self.best_metric!r} "
+                             f"(expected 'total' or 'action')")
         self.best_val_loss = float("inf")
         if float(getattr(config, "val_fraction", 0.0) or 0.0) > 0.0 and self.eval_interval > 0:
             val_dataset = MultiLatentLeRobotDataset(config=config, split="val")
@@ -310,21 +342,30 @@ class FlashWAMDistiller(DataMixin, StepMixin):
         denom = max(n, 1)
         means = {k: dist_mean((v / denom)).item() for k, v in sums.items()}
 
+        if self.best_metric == "action":
+            best_value = means["action"] + \
+                getattr(config, "action_aware_weight", 0.0) * means["action_aware"]
+        else:
+            best_value = means["total"]
+
         if config.rank == 0:
             logger.info(f"[step {self.step}] val loss={means['total']:.4f} "
-                        f"(v={means['video']:.4f} a={means['action']:.4f})")
+                        f"(v={means['video']:.4f} a={means['action']:.4f}) "
+                        f"best_metric[{self.best_metric}]={best_value:.4f}")
             if config.enable_wandb and HAS_WANDB:
                 wandb.log({
                     "val/loss_total": means["total"],
                     "val/video_consistency": means["video"],
                     "val/action_consistency": means["action"],
                     "val/action_aware": means["action_aware"],
+                    "val/best_metric": best_value,
                 }, step=self.step)
 
-        # Checkpoint selection: save best-by-val-loss.
-        if means["total"] < self.best_val_loss:
-            self.best_val_loss = means["total"]
+        # Checkpoint selection: save best-by-val-metric (raw student + EMA).
+        if best_value < self.best_val_loss:
+            self.best_val_loss = best_value
             self._save_checkpoint("online_student", subdir="best")
+            self._save_checkpoint("target_student", subdir="best")
 
     # ==================================================================
     # Main training loop

@@ -111,6 +111,8 @@ cfg.cfg_max = 10.0
 # Training
 # ============================================================
 cfg.learning_rate = 5e-6
+cfg.lr_scheduler_type = "constant"  # "constant" or "cosine" (decays to min_lr_ratio over max_train_steps)
+cfg.min_lr_ratio = 0.1              # cosine floor as a fraction of learning_rate
 cfg.beta1 = 0.9
 cfg.beta2 = 0.999
 cfg.weight_decay = 0.0
@@ -128,6 +130,7 @@ cfg.cfg_prob = 0.0                # no random CFG dropout — teacher handles CF
 # ============================================================
 cfg.save_interval = 1000
 cfg.gc_interval = 50
+cfg.best_metric = "total"  # "total" or "action" — which val metric picks checkpoints/best/
 cfg.enable_wandb = True
 cfg.wandb_entity = None
 cfg.seed = 42
